@@ -1,0 +1,20 @@
+{
+    "src_dir": "src",
+    "source_ex": ".c",
+    "header_ex": ".h",
+    "inc_dir": "inc",
+    "doc_dir": "doc",
+    "test_dir": "test",
+    "test_main": "main.sh",
+    "git_init": true,
+    "dep": {
+        "libft": {
+            "source": "/home/ria/Downloads/libft",
+            "link": "-Llib/libft -lft"
+        },
+        "mlx": {
+            "source": "https://github.com/42school/mlx_CLXV.git",
+            "link": "-lm -lmlx -lXext -lX11"
+        }
+    }
+}
