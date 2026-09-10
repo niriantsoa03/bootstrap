@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 """
 bootstrap.py - Scaffold a C or C++ project (sources, headers, Makefile, git
-repo, dependencies, tests and docs) from a JSON configuration file.
+repo, dependencies, tests and docs) from a JSON configuration file, and add
+classes/structs to an already-bootstrapped project.
 
 Usage:
     python3 bootstrap.py PROJECT_NAME
     python3 bootstrap.py PROJECT_NAME --config /path/to/config.json
     python3 bootstrap.py PROJECT_NAME -c /path/to/config.json
+
+    python3 bootstrap.py PROJECT_NAME -c config.json -k CLASS_NAME
+    python3 bootstrap.py PROJECT_NAME -c config.json --class CLASS_NAME
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
 
 # --------------------------------------------------------------------------
-# Colored output + progress spinner
+# Colored output + progress indicator
 # --------------------------------------------------------------------------
 
 class Color:
@@ -67,43 +68,24 @@ def error(msg: str) -> None:
 
 
 class Spinner:
-    """Shows `message` with a spinning indicator while a slow operation (a
-    git clone, a file/directory copy, a dependency build, ...) runs on the
-    main thread. Falls back to printing the message once, with no animation,
-    when stdout isn't a terminal -- so redirected/logged output stays clean
-    and isn't spammed with carriage returns."""
-
-    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    """Shows a single status line for a slow operation (a git clone, a
+    file/directory copy, a dependency build, ...). Writes the message once
+    (no animation loop) so it can't get garbled by terminals, pipes, or log
+    captures that don't honor in-place carriage-return redraw -- a
+    continuously-rewriting spinner showed up as dozens of concatenated
+    frames on some setups instead of overwriting in place. On exit, a bare
+    "\\r" ends the pending line before the caller prints its result line."""
 
     def __init__(self, message: str):
         self.message = message
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-
-    def _spin(self) -> None:
-        for frame in itertools.cycle(self.FRAMES):
-            if self._stop.is_set():
-                break
-            dot = _paint(frame, Color.CYAN, sys.stdout)
-            sys.stdout.write(f"\r{dot} {self.message}")
-            sys.stdout.flush()
-            time.sleep(0.08)
 
     def __enter__(self) -> "Spinner":
-        if self._is_tty:
-            self._thread = threading.Thread(target=self._spin, daemon=True)
-            self._thread.start()
-        else:
-            print(self.message)
+        sys.stdout.write(self.message)
+        sys.stdout.flush()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        if self._thread is not None:
-            self._stop.set()
-            self._thread.join()
-            sys.stdout.write("\r" + " " * (len(self.message) + 4) + "\r")
-            sys.stdout.flush()
+        print("\r")
         return False
 
 
@@ -136,16 +118,33 @@ def validate_project_name(project: str) -> None:
 # 1. Argument parsing
 # --------------------------------------------------------------------------
 
+class BootstrapArgumentParser(argparse.ArgumentParser):
+    """argparse's default usage-error exit status is 2; the spec requires
+    every fatal error -- including CLI usage errors like `-k` with no
+    value -- to exit 1."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        error(message)
+        sys.exit(1)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = BootstrapArgumentParser(
         prog="bootstrap.py",
-        description="Bootstrap a C project from a JSON configuration file.",
+        description="Bootstrap a C/C++ project from a JSON configuration "
+                     "file, or add a class/struct to an existing one.",
     )
     parser.add_argument("project_name", metavar="PROJECT_NAME",
-                         help="Name of the project to create.")
+                         help="Name of the project to create or modify.")
     parser.add_argument("-c", "--config", metavar="PATH", default=None,
                          help="Path to the configuration file "
-                              "(default: ~/.bootstrap.json).")
+                              "(default: ~/.bootstrap/config.json).")
+    parser.add_argument("-k", "--class", dest="class_name", metavar="CLASS_NAME",
+                         default=None,
+                         help="Add a class/struct named CLASS_NAME to an "
+                              "existing bootstrapped project instead of "
+                              "creating a new one.")
     return parser.parse_args(argv)
 
 
@@ -251,7 +250,7 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 def c_identifier(name: str) -> str:
-    """Turn PROJECT into a valid, upper-case C identifier for include guards."""
+    """Turn a name into a valid, upper-case C identifier for include guards."""
     ident = re.sub(r"[^0-9A-Za-z_]", "_", name).upper()
     if not ident or ident[0].isdigit():
         ident = "_" + ident
@@ -312,7 +311,7 @@ def create_project_skeleton(wd: Path, cfg: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------
-# 4-7. Source / header generation
+# 4-7. Source / header generation (initial project scaffold)
 # --------------------------------------------------------------------------
 
 def generate_header(wd: Path, cfg: dict[str, Any], project: str,
@@ -482,24 +481,56 @@ def build_dependency(name: str, dep_path: Path, strict: bool) -> tuple[bool, boo
     return True, True
 
 
-def default_link_flags(dep_path: Path, wd: Path) -> str:
-    """Inspect a built dependency for lib*.a archives and derive -L/-l flags."""
-    archives = sorted(dep_path.rglob("lib*.a")) if dep_path.is_dir() else (
-        [dep_path] if dep_path.is_file() and dep_path.name.startswith("lib") and dep_path.suffix == ".a" else []
+def default_link_flags(dep_path: Path, wd: Path, name: str) -> str:
+    """Inspect a built dependency and derive linker flags without requiring
+    an explicit `link` in the config. Preference order:
+
+    1. Conventional `lib<name>.a` archives -> `-L<dir> -l<name>`. Portable,
+       works regardless of where the executable is invoked from.
+    2. Any other `*.a` archive -> linked by its direct relative path, since
+       a non-conventional archive name (anything other than `lib*.a`) can
+       never be resolved via `-l` no matter what `-L` points at.
+    3. A file at the dependency's top level sharing the dependency's own
+       name (school-style Makefiles commonly name their output `NAME`
+       rather than `libNAME.a`, e.g. libft's Makefile emitting a bare
+       `lib/libft/libft`) -> also linked by direct relative path.
+    4. Otherwise: no link flags (treated as header-only).
+    """
+    if dep_path.is_file():
+        candidates = [dep_path]
+    elif dep_path.is_dir():
+        candidates = [p for p in dep_path.rglob("*") if p.is_file()]
+    else:
+        candidates = []
+
+    conventional = sorted(
+        p for p in candidates if p.name.startswith("lib") and p.suffix == ".a"
     )
-    flags = []
-    seen_dirs = set()
-    for archive in archives:
-        libname = archive.stem[3:]  # strip "lib" prefix, stem already strips ".a"
-        if not libname:
-            continue
-        rel_dir = archive.parent.relative_to(wd).as_posix()
-        entry = f"-L{rel_dir} -l{libname}"
-        key = (rel_dir, libname)
-        if key not in seen_dirs:
-            seen_dirs.add(key)
-            flags.append(entry)
-    return " ".join(flags)
+    if conventional:
+        flags, seen = [], set()
+        for archive in conventional:
+            libname = archive.stem[3:]  # strip "lib" prefix; stem already drops ".a"
+            if not libname:
+                continue
+            rel_dir = archive.parent.relative_to(wd).as_posix()
+            key = (rel_dir, libname)
+            if key not in seen:
+                seen.add(key)
+                flags.append(f"-L{rel_dir} -l{libname}")
+        return " ".join(flags)
+
+    other_archives = sorted(p for p in candidates if p.suffix == ".a")
+    if other_archives:
+        return " ".join(p.relative_to(wd).as_posix() for p in other_archives)
+
+    if dep_path.is_file():
+        return dep_path.relative_to(wd).as_posix()
+    if dep_path.is_dir():
+        named = dep_path / name
+        if named.is_file():
+            return named.relative_to(wd).as_posix()
+
+    return ""
 
 
 def install_dependencies(wd: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -526,7 +557,7 @@ def install_dependencies(wd: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         has_makefile_, built = build_dependency(name, dep_path, strict)
         link = spec["link"]
         if link is None:
-            link = default_link_flags(dep_path, wd)
+            link = default_link_flags(dep_path, wd, name)
         deps_info.append({
             "name": name,
             "path": dep_path,
@@ -538,7 +569,7 @@ def install_dependencies(wd: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# 8, 10, 11. Makefile generation
+# 8, 10, 11. Makefile generation (initial project scaffold)
 # --------------------------------------------------------------------------
 
 def generate_makefile(wd: Path, cfg: dict[str, Any], project: str,
@@ -733,6 +764,264 @@ def generate_layout_doc(wd: Path, cfg: dict[str, Any], project: str,
 
 
 # --------------------------------------------------------------------------
+# Class/struct generation mode (-k / --class)
+# --------------------------------------------------------------------------
+
+def validate_class_name(name: str) -> None:
+    """CLASS_NAME must be safe as both a filename and a C/C++ identifier."""
+    if not name:
+        raise BootstrapError("class name must not be empty")
+    if "/" in name or "\\" in name:
+        raise BootstrapError(f"class name must not contain path separators: {name!r}")
+    if ".." in name:
+        raise BootstrapError(f"class name must not contain '..': {name!r}")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        raise BootstrapError(
+            f"class name {name!r} is not a valid identifier "
+            f"(use letters, digits and underscores; it cannot start with a digit)"
+        )
+
+
+def build_class_header(class_name: str, cfg: dict[str, Any], body: str) -> str:
+    guard_suffix = cfg["header_ex"].lstrip(".").upper()
+    guard = f"{c_identifier(class_name)}_{guard_suffix}"
+    return f"#ifndef {guard}\n#define {guard}\n\n{body}\n#endif\n"
+
+
+def build_class_source(class_name: str, cfg: dict[str, Any],
+                        extra_includes: list[str], body: str) -> str:
+    header_name = f"{class_name}{cfg['header_ex']}"
+    includes = "".join(f"#include {inc}\n" for inc in extra_includes)
+    return f'#include "{header_name}"\n{includes}\n{body}'
+
+
+def generate_class_c(class_name: str) -> tuple[str, str]:
+    """C mode: a struct + create/erase/copy/get functions, per spec section 4.
+    `copy` takes only `other` -- `self` isn't needed to allocate and copy
+    `other`'s contents into a fresh structure."""
+    lname = class_name.lower()
+    struct_tag = f"s_{lname}"
+    type_name = f"t_{lname}"
+    prefix = f"{lname}_"
+
+    header = (
+        f"typedef struct {struct_tag}\n"
+        f"{{\n"
+        f"\t/* fields may be added later */\n"
+        f"}}\t{type_name};\n\n"
+        f"{type_name}\t*{prefix}create(void);\n"
+        f"void\t{prefix}erase({type_name} *self);\n"
+        f"{type_name}\t*{prefix}copy({type_name} *other);\n"
+        f"int\t{prefix}get({type_name} *self, int param);\n"
+    )
+    source = (
+        f"{type_name}\t*{prefix}create(void)\n"
+        f"{{\n"
+        f"\t{type_name}\t*self;\n\n"
+        f"\tself = malloc(sizeof({type_name}));\n"
+        f"\tif (!self)\n"
+        f"\t\treturn (NULL);\n"
+        f"\tbzero(self, sizeof({type_name}));\n"
+        f"\treturn (self);\n"
+        f"}}\n\n"
+        f"void\t{prefix}erase({type_name} *self)\n"
+        f"{{\n"
+        f"\tif (!self)\n"
+        f"\t\treturn ;\n"
+        f"\tfree(self);\n"
+        f"}}\n\n"
+        f"{type_name}\t*{prefix}copy({type_name} *other)\n"
+        f"{{\n"
+        f"\t{type_name}\t*self;\n\n"
+        f"\tself = malloc(sizeof({type_name}));\n"
+        f"\tif (!self)\n"
+        f"\t\treturn (NULL);\n"
+        f"\t*self = *other;\n"
+        f"\treturn (self);\n"
+        f"}}\n\n"
+        f"int\t{prefix}get({type_name} *self, int param)\n"
+        f"{{\n"
+        f"\t(void)self;\n"
+        f"\t(void)param;\n"
+        f"\treturn (-1);\n"
+        f"}}\n"
+    )
+    return header, source
+
+
+def generate_class_cpp(class_name: str) -> tuple[str, str]:
+    """C++ mode: a class with the canonical form (ctor, copy ctor, dtor,
+    operator=, operator[], operator()), per spec section 5. A single `_value`
+    member is introduced so operator[] can return a real reference instead
+    of one to a temporary."""
+    header = (
+        f"class {class_name}\n"
+        f"{{\n"
+        f"\tpublic:\n"
+        f"\t\t{class_name}();\n"
+        f"\t\t{class_name}(const {class_name} &other);\n"
+        f"\t\t~{class_name}();\n\n"
+        f"\t\t{class_name}\t&operator=(const {class_name} &other);\n"
+        f"\t\tint\t\t&operator[](int index);\n"
+        f"\t\tint\t\toperator()(int param) const;\n\n"
+        f"\tprivate:\n"
+        f"\t\tint\t_value;\n"
+        f"}};\n"
+    )
+    source = (
+        f"{class_name}::{class_name}() : _value(0)\n"
+        f"{{\n}}\n\n"
+        f"{class_name}::{class_name}(const {class_name} &other) : _value(other._value)\n"
+        f"{{\n}}\n\n"
+        f"{class_name}::~{class_name}()\n"
+        f"{{\n}}\n\n"
+        f"{class_name}\t&{class_name}::operator=(const {class_name} &other)\n"
+        f"{{\n"
+        f"\tif (this != &other)\n"
+        f"\t\t_value = other._value;\n"
+        f"\treturn (*this);\n"
+        f"}}\n\n"
+        f"int\t&{class_name}::operator[](int index)\n"
+        f"{{\n"
+        f"\t(void)index;\n"
+        f"\treturn (_value);\n"
+        f"}}\n\n"
+        f"int\t{class_name}::operator()(int param) const\n"
+        f"{{\n"
+        f"\t(void)param;\n"
+        f"\treturn (-1);\n"
+        f"}}\n"
+    )
+    return header, source
+
+
+def compute_makefile_update(makefile_text: str, source_rel: str) -> str | None:
+    """Return updated Makefile text with source_rel added to the LIB_SRC
+    source list, or None if no textual change is needed:
+      - LIB_SRC is generated with $(wildcard ...) (the default this script
+        produces) -- any file already placed in SRC_DIR is picked up on the
+        next `make` automatically, nothing to edit.
+      - source_rel is already listed (e.g. the class was added before) --
+        avoid a duplicate entry.
+    Raises BootstrapError if no LIB_SRC assignment can be found to update at
+    all, since guessing at an unfamiliar Makefile's structure isn't safe.
+    """
+    lines = makefile_text.splitlines()
+
+    block_start = None
+    block_end = None
+    for i, line in enumerate(lines):
+        if block_start is None:
+            if re.match(r"^\s*LIB_SRC\s*[:+]?=", line):
+                block_start = i
+                if not line.rstrip().endswith("\\"):
+                    block_end = i
+                    break
+                continue
+        else:
+            if not line.rstrip().endswith("\\"):
+                block_end = i
+                break
+    if block_start is None:
+        raise BootstrapError("cannot update Makefile: no LIB_SRC assignment found")
+    if block_end is None:
+        block_end = len(lines) - 1  # unterminated trailing continuation
+
+    block_text = "\n".join(lines[block_start:block_end + 1])
+
+    if "$(wildcard" in block_text:
+        return None
+
+    if re.search(rf"(?<![\w./]){re.escape(source_rel)}(?![\w./])", block_text):
+        return None
+
+    if block_end > block_start:
+        indent_match = re.match(r"^(\s*)", lines[block_start + 1])
+        indent = indent_match.group(1) if indent_match else "\t"
+        last_line = lines[block_end]
+        if not last_line.rstrip().endswith("\\"):
+            lines[block_end] = last_line + " \\"
+        lines.insert(block_end + 1, f"{indent}{source_rel}")
+    else:
+        lines[block_start] = lines[block_start] + f" {source_rel}"
+
+    new_text = "\n".join(lines)
+    if makefile_text.endswith("\n"):
+        new_text += "\n"
+    return new_text
+
+
+def add_class(project: str, config_path: Path, class_name: str) -> None:
+    """Add a class/struct to an already-bootstrapped project. Validates
+    everything (name, target files, Makefile update feasibility) before
+    writing anything, per the spec's atomicity requirement, and rolls back
+    files it already wrote if a later step in the same operation fails."""
+    wd = Path.cwd() / project
+    if not wd.is_dir():
+        raise BootstrapError(f"project directory does not exist: {wd}")
+
+    validate_class_name(class_name)
+    cfg = validate_config(load_config(config_path))
+    language = cfg["_language"]
+
+    src_path = wd / cfg["src_dir"] / f"{class_name}{cfg['source_ex']}"
+    header_path = wd / cfg["inc_dir"] / f"{class_name}{cfg['header_ex']}"
+
+    existing = [str(p) for p in (header_path, src_path) if p.exists()]
+    if existing:
+        raise BootstrapError(f"refusing to overwrite existing file(s): {', '.join(existing)}")
+
+    if language == "c":
+        header_body, source_body = generate_class_c(class_name)
+        extra_includes = ["<stdlib.h>", "<strings.h>"]
+    else:
+        header_body, source_body = generate_class_cpp(class_name)
+        extra_includes = []
+
+    header_text = build_class_header(class_name, cfg, header_body)
+    source_text = build_class_source(class_name, cfg, extra_includes, source_body)
+
+    makefile_path = wd / "Makefile"
+    if not makefile_path.is_file():
+        raise BootstrapError(f"Makefile not found in project: {makefile_path}")
+    try:
+        makefile_text = makefile_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BootstrapError(f"cannot read Makefile: {exc}")
+
+    source_rel = f"{cfg['src_dir']}/{class_name}{cfg['source_ex']}"
+    # Raises BootstrapError here if the Makefile can't be safely updated --
+    # before anything has been written to disk.
+    new_makefile_text = compute_makefile_update(makefile_text, source_rel)
+
+    # Validation complete -- perform the writes, rolling back on failure.
+    try:
+        (wd / cfg["src_dir"]).mkdir(parents=True, exist_ok=True)
+        (wd / cfg["inc_dir"]).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BootstrapError(f"failed to create directories: {exc}")
+
+    try:
+        header_path.write_text(header_text, encoding="utf-8")
+    except OSError as exc:
+        raise BootstrapError(f"failed to write header file: {exc}")
+
+    try:
+        src_path.write_text(source_text, encoding="utf-8")
+    except OSError as exc:
+        header_path.unlink(missing_ok=True)
+        raise BootstrapError(f"failed to write source file: {exc}")
+
+    if new_makefile_text is not None:
+        try:
+            makefile_path.write_text(new_makefile_text, encoding="utf-8")
+        except OSError as exc:
+            src_path.unlink(missing_ok=True)
+            header_path.unlink(missing_ok=True)
+            raise BootstrapError(f"failed to update Makefile: {exc}")
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -775,9 +1064,13 @@ def bootstrap(project: str, config_path: Path) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
-    config_path = Path(args.config).expanduser() if args.config else Path("~/.bootstrap.json").expanduser()
+    config_path = Path(args.config).expanduser() if args.config else Path("~/.bootstrap/config.json").expanduser()
 
     try:
+        if args.class_name is not None:
+            add_class(args.project_name, config_path, args.class_name)
+            success(f"Added '{args.class_name}' to project '{args.project_name}'.")
+            return 0
         failed_deps = bootstrap(args.project_name, config_path)
     except BootstrapError as exc:
         error(str(exc))
